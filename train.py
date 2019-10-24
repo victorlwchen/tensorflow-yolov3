@@ -22,9 +22,16 @@ from core.dataset import Dataset
 from core.yolov3 import YOLOV3
 from core.config import cfg
 
+import horovod.tensorflow as hvd
 
 class YoloTrain(object):
     def __init__(self):
+    
+        # Initialize Horovod
+        hvd.init()
+        config=tf.ConfigProto(allow_soft_placement=True)
+        config.gpu_options.visible_device_list = str(hvd.local_rank())
+        
         self.anchor_per_scale    = cfg.YOLO.ANCHOR_PER_SCALE
         self.classes             = utils.read_class_names(cfg.YOLO.CLASSES)
         self.num_classes         = len(self.classes)
@@ -41,8 +48,9 @@ class YoloTrain(object):
         self.trainset            = Dataset('train')
         self.testset             = Dataset('test')
         self.steps_per_period    = len(self.trainset)
-        self.sess                = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
-
+        self.sess                = tf.Session(config=config)
+        
+        
         with tf.name_scope('define_input'):
             self.input_data   = tf.placeholder(dtype=tf.float32, name='input_data')
             self.label_sbbox  = tf.placeholder(dtype=tf.float32, name='label_sbbox')
@@ -75,6 +83,8 @@ class YoloTrain(object):
                                         (self.global_step - warmup_steps) / (train_steps - warmup_steps) * np.pi))
             )
             global_step_update = tf.assign_add(self.global_step, 1.0)
+            #for Horovod expand learning rate
+            self.learn_rate = self.learn_rate * hvd.size()
 
         with tf.name_scope("define_weight_decay"):
             moving_ave = tf.train.ExponentialMovingAverage(self.moving_ave_decay).apply(tf.trainable_variables())
@@ -86,9 +96,15 @@ class YoloTrain(object):
                 var_name_mess = str(var_name).split('/')
                 if var_name_mess[0] in ['conv_sbbox', 'conv_mbbox', 'conv_lbbox']:
                     self.first_stage_trainable_var_list.append(var)
-
-            first_stage_optimizer = tf.train.AdamOptimizer(self.learn_rate).minimize(self.loss,
+            
+            first_opt = tf.train.AdamOptimizer(self.learn_rate)
+            #for Horovod
+            first_opt = hvd.DistributedOptimizer(first_opt)
+            #for Horovod
+            hooks = [hvd.BroadcastGlobalVariablesHook(0)]
+            first_stage_optimizer = first_opt.minimize(self.loss,
                                                       var_list=self.first_stage_trainable_var_list)
+                                                    
             with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
                 with tf.control_dependencies([first_stage_optimizer, global_step_update]):
                     with tf.control_dependencies([moving_ave]):
@@ -96,7 +112,10 @@ class YoloTrain(object):
 
         with tf.name_scope("define_second_stage_train"):
             second_stage_trainable_var_list = tf.trainable_variables()
-            second_stage_optimizer = tf.train.AdamOptimizer(self.learn_rate).minimize(self.loss,
+            second_opt = tf.train.AdamOptimizer(self.learn_rate)
+            #for Horovod
+            second_opt = hvd.DistributedOptimizer(second_opt)
+            second_stage_optimizer = second_opt.minimize(self.loss,
                                                       var_list=second_stage_trainable_var_list)
 
             with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
@@ -173,11 +192,13 @@ class YoloTrain(object):
                 test_epoch_loss.append(test_step_loss)
 
             train_epoch_loss, test_epoch_loss = np.mean(train_epoch_loss), np.mean(test_epoch_loss)
-            ckpt_file = "./checkpoint/yolov3_test_loss=%.4f.ckpt" % test_epoch_loss
+            ckpt_file = "./checkpoint/yolov3_test_loss=%.4f.ckpt" % test_epoch_loss 
             log_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
             print("=> Epoch: %2d Time: %s Train loss: %.2f Test loss: %.2f Saving %s ..."
                             %(epoch, log_time, train_epoch_loss, test_epoch_loss, ckpt_file))
-            self.saver.save(self.sess, ckpt_file, global_step=epoch)
+            #for Horovod
+            if hvd.rank() == 0:
+                self.saver.save(self.sess, ckpt_file, global_step=epoch)
 
 
 
